@@ -1,20 +1,71 @@
 // ============================================================
-// Journal Scanner — Full-Stack Server
+// Journal Scanner — Full-Stack Server (v2: Server-Side Settings)
 // ============================================================
-// Serves the React frontend as HTML and proxies Notion API calls.
+// Settings are stored in a JSON file on disk so they persist
+// across restarts and work from any device.
 //
-// Deploy to Render:
+// Deploy to Render (with a persistent disk mounted at /data):
 //   Build command: npm install
 //   Start command: node server.js
+//   Env var (optional): SETTINGS_DIR=/data
 //
 // Dependencies: express, cors
 // ============================================================
 
 const express = require("express");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// ── Settings persistence ──
+// Use SETTINGS_DIR env var for Render persistent disk, fallback to ./data
+const SETTINGS_DIR = process.env.SETTINGS_DIR || path.join(__dirname, "data");
+const SETTINGS_FILE = path.join(SETTINGS_DIR, "settings.json");
+
+function ensureSettingsDir() {
+  if (!fs.existsSync(SETTINGS_DIR)) {
+    fs.mkdirSync(SETTINGS_DIR, { recursive: true });
+  }
+}
+
+function loadSettings() {
+  try {
+    ensureSettingsDir();
+    if (fs.existsSync(SETTINGS_FILE)) {
+      const raw = fs.readFileSync(SETTINGS_FILE, "utf-8");
+      return JSON.parse(raw);
+    }
+  } catch (err) {
+    console.error("Failed to load settings:", err.message);
+  }
+  return { notionToken: "", notionDatabaseId: "", googleVisionKey: "" };
+}
+
+function saveSettings(settings) {
+  try {
+    ensureSettingsDir();
+    const toSave = {
+      notionToken: settings.notionToken || "",
+      notionDatabaseId: settings.notionDatabaseId || "",
+      googleVisionKey: settings.googleVisionKey || "",
+    };
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(toSave, null, 2), "utf-8");
+    return true;
+  } catch (err) {
+    console.error("Failed to save settings:", err.message);
+    return false;
+  }
+}
+
+function maskKey(key, prefix) {
+  if (!key) return "";
+  const pre = prefix && key.startsWith(prefix) ? prefix : key.slice(0, 4);
+  const suf = key.slice(-4);
+  return pre + "••••••••" + suf;
+}
 
 // Middleware
 app.use(cors());
@@ -25,17 +76,59 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// ── Proxy: Create Notion page ──
+// ── Settings API ──
+app.get("/api/settings", (req, res) => {
+  const settings = loadSettings();
+  res.json({
+    notionToken: settings.notionToken ? maskKey(settings.notionToken, "ntn_") : "",
+    notionDatabaseId: settings.notionDatabaseId || "",
+    googleVisionKey: settings.googleVisionKey ? maskKey(settings.googleVisionKey, "AIza") : "",
+    isConfigured: !!(settings.notionToken && settings.notionDatabaseId && settings.googleVisionKey),
+  });
+});
+
+app.put("/api/settings", (req, res) => {
+  const current = loadSettings();
+  const incoming = req.body || {};
+  const updated = { ...current };
+
+  // Only update fields that are provided and non-masked
+  if (incoming.notionToken && !incoming.notionToken.includes("••••")) {
+    updated.notionToken = incoming.notionToken;
+  }
+  if (incoming.notionDatabaseId !== undefined) {
+    updated.notionDatabaseId = incoming.notionDatabaseId;
+  }
+  if (incoming.googleVisionKey && !incoming.googleVisionKey.includes("••••")) {
+    updated.googleVisionKey = incoming.googleVisionKey;
+  }
+
+  const ok = saveSettings(updated);
+  if (ok) {
+    res.json({
+      success: true,
+      notionToken: updated.notionToken ? maskKey(updated.notionToken, "ntn_") : "",
+      notionDatabaseId: updated.notionDatabaseId || "",
+      googleVisionKey: updated.googleVisionKey ? maskKey(updated.googleVisionKey, "AIza") : "",
+      isConfigured: !!(updated.notionToken && updated.notionDatabaseId && updated.googleVisionKey),
+    });
+  } else {
+    res.status(500).json({ success: false, message: "Failed to save settings" });
+  }
+});
+
+// ── Proxy: Create Notion page (uses server-stored token) ──
 app.post("/api/notion/pages", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) {
-    return res.status(401).json({ message: "Missing Authorization header" });
+  const settings = loadSettings();
+  const token = settings.notionToken;
+  if (!token) {
+    return res.status(401).json({ message: "Notion token not configured. Go to Settings." });
   }
   try {
     const response = await fetch("https://api.notion.com/v1/pages", {
       method: "POST",
       headers: {
-        Authorization: authHeader,
+        Authorization: "Bearer " + token,
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28",
       },
@@ -58,9 +151,10 @@ app.post("/api/notion/pages", async (req, res) => {
 
 // ── Proxy: Query Notion database ──
 app.post("/api/notion/databases/:id/query", async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) {
-    return res.status(401).json({ message: "Missing Authorization header" });
+  const settings = loadSettings();
+  const token = settings.notionToken;
+  if (!token) {
+    return res.status(401).json({ message: "Notion token not configured." });
   }
   try {
     const response = await fetch(
@@ -68,7 +162,7 @@ app.post("/api/notion/databases/:id/query", async (req, res) => {
       {
         method: "POST",
         headers: {
-          Authorization: authHeader,
+          Authorization: "Bearer " + token,
           "Content-Type": "application/json",
           "Notion-Version": "2022-06-28",
         },
@@ -89,6 +183,30 @@ app.post("/api/notion/databases/:id/query", async (req, res) => {
   }
 });
 
+// ── Proxy: OCR via Google Vision (keeps key server-side) ──
+app.post("/api/ocr", async (req, res) => {
+  const settings = loadSettings();
+  const key = settings.googleVisionKey;
+  if (!key) {
+    return res.status(401).json({ message: "Google Vision API key not configured. Go to Settings." });
+  }
+  try {
+    const response = await fetch(
+      "https://vision.googleapis.com/v1/images:annotate?key=" + key,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(req.body),
+      }
+    );
+    const data = await response.json();
+    res.status(response.ok ? 200 : response.status).json(data);
+  } catch (error) {
+    console.error("Vision API proxy error:", error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // ── Serve the React app ──
 app.get("/", (req, res) => {
   res.send(getHTML());
@@ -96,7 +214,11 @@ app.get("/", (req, res) => {
 
 // ── Start ──
 app.listen(PORT, () => {
-  console.log(`\n📓 Journal Scanner running on http://localhost:${PORT}\n`);
+  const settings = loadSettings();
+  const configured = settings.notionToken && settings.notionDatabaseId && settings.googleVisionKey;
+  console.log(`\n📓 Journal Scanner running on http://localhost:${PORT}`);
+  console.log(`   Settings file: ${SETTINGS_FILE}`);
+  console.log(`   Configured: ${configured ? "✅ Yes" : "❌ No — open the app and go to Settings"}\n`);
 });
 
 // ============================================================
@@ -115,6 +237,7 @@ function getHTML() {
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Source Serif 4', Georgia, serif; background: #f5f0e8; color: #2d2d3f; }
     @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
     input:focus, textarea:focus { border-color: #8b4513 !important; box-shadow: 0 0 0 3px rgba(139,69,19,0.12); outline: none; }
     button { cursor: pointer; }
     button:hover { opacity: 0.88; }
@@ -185,9 +308,9 @@ function getHTML() {
     }
 
     // ============================================================
-    // ScanView
+    // ScanView — now uses server-side API keys
     // ============================================================
-    function ScanView({ settings, entries, setEntries, isConfigured }) {
+    function ScanView({ isConfigured, entries, setEntries }) {
       const [status, setStatus] = useState(STATUS.IDLE);
       const [imageData, setImageData] = useState(null);
       const [fileName, setFileName] = useState("");
@@ -211,12 +334,12 @@ function getHTML() {
         if (!file) return;
         setError(""); setFileName(file.name); setStatus(STATUS.UPLOADING); setProgress("Reading image...");
         const reader = new FileReader();
-        reader.onload = async (e) => {
-          const base64Full = e.target.result;
+        reader.onload = async (ev) => {
+          const base64Full = ev.target.result;
           const base64Data = base64Full.split(",")[1];
           setImageData(base64Full); setStatus(STATUS.PROCESSING); setProgress("Running handwriting OCR...");
 
-          if (!settings.googleVisionKey) {
+          if (!isConfigured) {
             await new Promise(r => setTimeout(r, 1500));
             setOcrText(SAMPLE_OCR); setEditedText(SAMPLE_OCR);
             setEntryTitle("Journal Entry \\u2014 " + entryDate);
@@ -224,13 +347,20 @@ function getHTML() {
           }
 
           try {
-            const resp = await fetch(
-              "https://vision.googleapis.com/v1/images:annotate?key=" + settings.googleVisionKey,
-              { method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ requests: [{ image: { content: base64Data }, features: [{ type: "DOCUMENT_TEXT_DETECTION", maxResults: 1 }], imageContext: { languageHints: ["en"] } }] }) }
-            );
+            const resp = await fetch("/api/ocr", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                requests: [{
+                  image: { content: base64Data },
+                  features: [{ type: "DOCUMENT_TEXT_DETECTION", maxResults: 1 }],
+                  imageContext: { languageHints: ["en"] }
+                }]
+              })
+            });
             const d = await resp.json();
-            if (d.error) throw new Error(d.error.message);
+            if (d.error) throw new Error(d.error.message || d.message || "OCR failed");
+            if (d.message && !d.responses) throw new Error(d.message);
             const fullText = d.responses?.[0]?.fullTextAnnotation?.text || "";
             if (!fullText) throw new Error("No text detected. Try a clearer photo.");
             setOcrText(fullText); setEditedText(fullText);
@@ -240,15 +370,18 @@ function getHTML() {
           } catch (err) { setError("OCR Error: " + err.message); setStatus(STATUS.ERROR); setProgress(""); }
         };
         reader.readAsDataURL(file);
-      }, [settings.googleVisionKey, entryDate]);
+      }, [isConfigured, entryDate]);
 
       const sendToNotion = async () => {
-        if (!settings.notionToken || !settings.notionDatabaseId) { setError("Please configure Notion credentials in Settings."); return; }
         setStatus(STATUS.SENDING); setProgress("Creating Notion page..."); setError("");
         try {
-          const proxyBase = settings.proxyUrl || "";
+          const sr = await fetch("/api/settings");
+          const sd = await sr.json();
+          const dbId = sd.notionDatabaseId;
+          if (!dbId) throw new Error("Notion Database ID not configured. Go to Settings.");
+
           const notionBody = {
-            parent: { database_id: settings.notionDatabaseId },
+            parent: { database_id: dbId },
             properties: {
               Name: { title: [{ text: { content: entryTitle } }] },
               Date: { date: { start: entryDate } },
@@ -263,8 +396,10 @@ function getHTML() {
               { object: "block", type: "paragraph", paragraph: { rich_text: [{ type: "text", text: { content: "📎 Original handwritten page image is attached to this entry." } }] } },
             ],
           };
-          const response = await fetch(proxyBase + "/api/notion/pages", {
-            method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + settings.notionToken },
+
+          const response = await fetch("/api/notion/pages", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify(notionBody),
           });
           if (!response.ok) { const ed = await response.json().catch(() => ({})); throw new Error(ed.message || "Notion API error: " + response.status); }
@@ -285,7 +420,6 @@ function getHTML() {
           <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => handleFile(e.target.files?.[0])} />
           <input ref={camRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={e => handleFile(e.target.files?.[0])} />
 
-          {/* IDLE */}
           {(status === STATUS.IDLE || status === STATUS.ERROR) && !imageData && (
             <div style={{ textAlign: "center", padding: "60px 24px", border: "2px dashed " + P.borderDark, borderRadius: 16, background: P.white }}>
               <div style={{ marginBottom: 16 }}>
@@ -302,7 +436,6 @@ function getHTML() {
             </div>
           )}
 
-          {/* PROCESSING */}
           {(status === STATUS.UPLOADING || status === STATUS.PROCESSING) && (
             <div style={{ textAlign: "center", padding: "40px 24px" }}>
               {imageData && <img src={imageData} alt="Preview" style={{ maxWidth: 300, maxHeight: 300, borderRadius: 12, border: "1px solid " + P.border, marginBottom: 24, objectFit: "contain" }} />}
@@ -313,7 +446,6 @@ function getHTML() {
             </div>
           )}
 
-          {/* OCR COMPLETE — Review */}
           {status === STATUS.OCR_COMPLETE && (
             <div style={{ background: P.white, borderRadius: 16, padding: 24, boxShadow: "0 2px 12px rgba(0,0,0,0.04)" }}>
               <div className="review-grid" style={{ display: "grid", gridTemplateColumns: "minmax(200px, 1fr) 2fr", gap: 28 }}>
@@ -344,7 +476,6 @@ function getHTML() {
             </div>
           )}
 
-          {/* SENDING */}
           {status === STATUS.SENDING && (
             <div style={{ textAlign: "center", padding: "40px 24px" }}>
               <div style={{ display: "inline-flex", alignItems: "center", gap: 14, padding: "16px 28px", background: P.white, borderRadius: 12, boxShadow: "0 2px 12px rgba(0,0,0,0.06)" }}>
@@ -354,7 +485,6 @@ function getHTML() {
             </div>
           )}
 
-          {/* COMPLETE */}
           {status === STATUS.COMPLETE && (
             <div style={{ textAlign: "center", padding: "60px 24px" }}>
               <div style={{ width: 60, height: 60, borderRadius: "50%", background: P.sageMuted, color: P.sage, fontSize: 28, display: "inline-flex", alignItems: "center", justifyContent: "center", marginBottom: 16 }}>✓</div>
@@ -365,7 +495,6 @@ function getHTML() {
             </div>
           )}
 
-          {/* ERROR */}
           {error && (
             <div style={{ background: P.redMuted, border: "1px solid " + P.red, borderRadius: 10, padding: "12px 16px", marginTop: 20, fontSize: 13, color: P.red, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <span><strong>Error:</strong> {error}</span>
@@ -447,15 +576,73 @@ function getHTML() {
     }
 
     // ============================================================
-    // SettingsView
+    // SettingsView — loads/saves via server API
     // ============================================================
-    function SettingsView({ settings, setSettings }) {
+    function SettingsView({ isConfigured, onSettingsChanged }) {
+      const [form, setForm] = useState({ notionToken: "", notionDatabaseId: "", googleVisionKey: "" });
+      const [loading, setLoading] = useState(true);
+      const [saving, setSaving] = useState(false);
+      const [saveMsg, setSaveMsg] = useState(null);
       const [showTokens, setShowTokens] = useState({ notion: false, vision: false });
-      const update = (key, val) => setSettings(s => ({ ...s, [key]: val }));
+
+      useEffect(() => {
+        fetch("/api/settings")
+          .then(r => r.json())
+          .then(data => {
+            setForm({
+              notionToken: data.notionToken || "",
+              notionDatabaseId: data.notionDatabaseId || "",
+              googleVisionKey: data.googleVisionKey || "",
+            });
+            setLoading(false);
+          })
+          .catch(() => setLoading(false));
+      }, []);
+
+      const update = (key, val) => { setForm(f => ({ ...f, [key]: val })); setSaveMsg(null); };
+
+      const handleSave = async () => {
+        setSaving(true); setSaveMsg(null);
+        try {
+          const resp = await fetch("/api/settings", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(form),
+          });
+          const data = await resp.json();
+          if (data.success) {
+            setSaveMsg({ type: "success", text: "Settings saved! They now work on all your devices." });
+            setForm({ notionToken: data.notionToken || "", notionDatabaseId: data.notionDatabaseId || "", googleVisionKey: data.googleVisionKey || "" });
+            if (onSettingsChanged) onSettingsChanged(data.isConfigured);
+          } else { throw new Error(data.message || "Save failed"); }
+        } catch (err) { setSaveMsg({ type: "error", text: "Failed to save: " + err.message }); }
+        setSaving(false);
+      };
+
+      if (loading) {
+        return (
+          <div style={{ textAlign: "center", padding: "60px 24px" }}>
+            <div style={{ width: 20, height: 20, border: "2px solid " + P.border, borderTopColor: P.accent, borderRadius: "50%", animation: "spin 0.8s linear infinite", margin: "0 auto 12px" }} />
+            <p style={{ color: P.textMuted, fontSize: 14 }}>Loading settings...</p>
+          </div>
+        );
+      }
 
       return (
         <div>
-          <h2 style={{ fontSize: 20, fontWeight: 700, color: P.ink, margin: 0 }}>Configuration</h2>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+            <h2 style={{ fontSize: 20, fontWeight: 700, color: P.ink, margin: 0 }}>Configuration</h2>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              {isConfigured && <span style={{ fontSize: 12, color: P.sage, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 4 }}>✓ Connected</span>}
+              <span style={{ fontSize: 11, color: P.textMuted, background: P.cream, padding: "4px 10px", borderRadius: 6 }}>🔒 Keys stored server-side</span>
+            </div>
+          </div>
+
+          {saveMsg && (
+            <div style={{ marginTop: 12, padding: "10px 14px", borderRadius: 8, fontSize: 13, animation: "fadeIn 0.2s ease-out", background: saveMsg.type === "success" ? P.sageMuted : P.redMuted, color: saveMsg.type === "success" ? P.sage : P.red, border: "1px solid " + (saveMsg.type === "success" ? P.sage : P.red) }}>
+              {saveMsg.type === "success" ? "✓ " : "✕ "}{saveMsg.text}
+            </div>
+          )}
 
           {/* Notion */}
           <div style={S.card}>
@@ -468,11 +655,11 @@ function getHTML() {
             </div>
             <label style={S.fieldLabel}>Integration Token</label>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <input type={showTokens.notion ? "text" : "password"} value={settings.notionToken} onChange={e => update("notionToken", e.target.value)} style={{ ...S.textInput, flex: 1, marginBottom: 0 }} placeholder="ntn_..." />
+              <input type={showTokens.notion ? "text" : "password"} value={form.notionToken} onChange={e => update("notionToken", e.target.value)} onFocus={e => { if (e.target.value.includes("••••")) update("notionToken", ""); }} style={{ ...S.textInput, flex: 1, marginBottom: 0 }} placeholder="ntn_..." />
               <button onClick={() => setShowTokens(s => ({...s, notion: !s.notion}))} style={{ padding: "9px 14px", border: "1.5px solid " + P.border, borderRadius: 8, background: P.cream, fontSize: 12, fontWeight: 600, color: P.textMuted, fontFamily: "inherit" }}>{showTokens.notion ? "Hide" : "Show"}</button>
             </div>
             <label style={{ ...S.fieldLabel, marginTop: 14 }}>Database ID</label>
-            <input type="text" value={settings.notionDatabaseId} onChange={e => update("notionDatabaseId", e.target.value)} style={S.textInput} placeholder="abc123def456..." />
+            <input type="text" value={form.notionDatabaseId} onChange={e => update("notionDatabaseId", e.target.value)} style={S.textInput} placeholder="abc123def456..." />
             <div style={S.helpBox}>
               <strong>Setup Steps:</strong>
               <ol style={{ margin: "6px 0 0", paddingLeft: 20, fontSize: 13 }}>
@@ -496,7 +683,7 @@ function getHTML() {
             </div>
             <label style={S.fieldLabel}>API Key</label>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <input type={showTokens.vision ? "text" : "password"} value={settings.googleVisionKey} onChange={e => update("googleVisionKey", e.target.value)} style={{ ...S.textInput, flex: 1, marginBottom: 0 }} placeholder="AIza..." />
+              <input type={showTokens.vision ? "text" : "password"} value={form.googleVisionKey} onChange={e => update("googleVisionKey", e.target.value)} onFocus={e => { if (e.target.value.includes("••••")) update("googleVisionKey", ""); }} style={{ ...S.textInput, flex: 1, marginBottom: 0 }} placeholder="AIza..." />
               <button onClick={() => setShowTokens(s => ({...s, vision: !s.vision}))} style={{ padding: "9px 14px", border: "1.5px solid " + P.border, borderRadius: 8, background: P.cream, fontSize: 12, fontWeight: 600, color: P.textMuted, fontFamily: "inherit" }}>{showTokens.vision ? "Hide" : "Show"}</button>
             </div>
             <div style={S.helpBox}>
@@ -512,17 +699,12 @@ function getHTML() {
             </div>
           </div>
 
-          {/* Proxy */}
-          <div style={S.card}>
-            <div style={{ display: "flex", gap: 12, alignItems: "flex-start", marginBottom: 16 }}>
-              <span style={{ fontSize: 22 }}>🔌</span>
-              <div>
-                <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: P.ink }}>Proxy Server</h3>
-                <p style={{ margin: "2px 0 0", fontSize: 13, color: P.textMuted }}>The Notion API proxy. Leave empty to use this server (same origin).</p>
-              </div>
-            </div>
-            <label style={S.fieldLabel}>Proxy URL (optional)</label>
-            <input type="text" value={settings.proxyUrl} onChange={e => update("proxyUrl", e.target.value)} style={S.textInput} placeholder="Leave empty for same-origin (recommended)" />
+          {/* Save Button */}
+          <div style={{ marginTop: 24, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <button onClick={handleSave} disabled={saving} style={{ ...S.primaryBtn, opacity: saving ? 0.6 : 1, minWidth: 160, justifyContent: "center" }}>
+              {saving ? "Saving..." : "Save Settings"}
+            </button>
+            <span style={{ fontSize: 12, color: P.textMuted }}>Settings persist across all devices and server restarts</span>
           </div>
         </div>
       );
@@ -534,15 +716,18 @@ function getHTML() {
     function App() {
       const [entries, setEntries] = useState([]);
       const [activeTab, setActiveTab] = useState("scan");
-      const [settings, setSettings] = useState({
-        notionToken: "", notionDatabaseId: "", googleVisionKey: "", proxyUrl: "",
-      });
+      const [isConfigured, setIsConfigured] = useState(false);
+      const [loadingConfig, setLoadingConfig] = useState(true);
 
-      const isConfigured = settings.notionToken && settings.notionDatabaseId && settings.googleVisionKey;
+      useEffect(() => {
+        fetch("/api/settings")
+          .then(r => r.json())
+          .then(data => { setIsConfigured(data.isConfigured); setLoadingConfig(false); })
+          .catch(() => setLoadingConfig(false));
+      }, []);
 
       return (
         <div style={{ fontFamily: "'Source Serif 4', Georgia, serif", background: P.paper, minHeight: "100vh", color: P.text }}>
-          {/* Header */}
           <header style={{ background: P.white, borderBottom: "1px solid " + P.border, position: "sticky", top: 0, zIndex: 100 }}>
             <div style={{ maxWidth: 960, margin: "0 auto", padding: "12px 24px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -570,18 +755,16 @@ function getHTML() {
             </div>
           </header>
 
-          {/* Main */}
           <main style={{ maxWidth: 960, margin: "0 auto", padding: "24px 24px 80px" }}>
-            {!isConfigured && activeTab !== "settings" && <ConfigBanner onGo={() => setActiveTab("settings")} />}
-            {activeTab === "scan" && <ScanView settings={settings} entries={entries} setEntries={setEntries} isConfigured={isConfigured} />}
+            {!loadingConfig && !isConfigured && activeTab !== "settings" && <ConfigBanner onGo={() => setActiveTab("settings")} />}
+            {activeTab === "scan" && <ScanView isConfigured={isConfigured} entries={entries} setEntries={setEntries} />}
             {activeTab === "entries" && <EntriesView entries={entries} />}
-            {activeTab === "settings" && <SettingsView settings={settings} setSettings={setSettings} />}
+            {activeTab === "settings" && <SettingsView isConfigured={isConfigured} onSettingsChanged={setIsConfigured} />}
           </main>
         </div>
       );
     }
 
-    // ── Render ──
     const root = ReactDOM.createRoot(document.getElementById("root"));
     root.render(<App />);
   </script>
