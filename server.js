@@ -1,72 +1,118 @@
 const express = require('express');
 const cors = require('cors');
-const { Client } = require('@notionhq/client');
+const path = require('path');
 
 const app = express();
+const PORT = process.env.PORT || 3001;
+
+// Enable CORS for all origins
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-app.post('/api/ocr', async (req, res) => {
-  try {
-    const { image, apiKey } = req.body;
-    if (!apiKey) return res.status(400).json({ message: 'Missing API key' });
-    
-    const base64Image = image.split(',')[1];
-    const response = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        requests: [{ image: { content: base64Image }, features: [{ type: 'DOCUMENT_TEXT_DETECTION' }] }]
-      })
-    });
-    
-    const data = await response.json();
-    res.json({ text: data.responses[0]?.fullTextAnnotation?.text || '' });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
+// Serve static files
+app.use(express.static('.'));
+
+// Serve index.html at root
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
 });
 
+// Proxy endpoint for Notion API
 app.post('/api/notion', async (req, res) => {
   try {
-    const { token, databaseId, title, content, date, tags, source } = req.body;
-    if (!token || !databaseId) return res.status(400).json({ message: 'Missing credentials' });
+    const { databaseId, content, imageUrl } = req.body;
     
-    const notion = new Client({ auth: token });
-    const properties = { Name: { title: [{ text: { content: title || 'Untitled' } }] } };
-    if (date) properties.Date = { date: { start: date } };
-    if (tags?.length) properties.Tags = { multi_select: tags.map(tag => ({ name: tag })) };
-    if (source) properties.Source = { select: { name: source } };
-    
-    const response = await notion.pages.create({
-      parent: { database_id: databaseId },
-      properties,
-      children: content ? [{ object: 'block', type: 'paragraph', paragraph: { rich_text: [{ type: 'text', text: { content } }] } }] : []
+    const response = await fetch('https://api.notion.com/v1/pages', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.NOTION_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28'
+      },
+      body: JSON.stringify({
+        parent: { database_id: databaseId },
+        properties: {
+          'Page': {
+            title: [{
+              text: {
+                content: `Journal Entry - ${new Date().toLocaleDateString()}`
+              }
+            }]
+          },
+          'Content': {
+            rich_text: [{
+              text: {
+                content: content ||  'No text extracted'
+              }
+            }]
+          },
+          'Date': {
+            date: {
+              start: new Date().toISOString().split('T')[0]
+            }
+          }
+        },
+        children: imageUrl ? [{
+          object: 'block',
+          type: 'image',
+          image: {
+            type: 'external',
+            external: {
+              url: imageUrl
+            }
+          }
+        }] : []
+      })
     });
+
+    const data = await response.json();
     
-    res.json({ success: true, pageId: response.id });
+    if (!response.ok) {
+      throw new Error(data.message || 'Notion API error');
+    }
+
+    res.json(data);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Notion API Error:', error);
+    res.status(500).json({ 
+      error: error.message,
+      details: 'Failed to create Notion page'
+    });
   }
 });
 
-app.post('/api/notion/databases/:id/query', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ message: "Missing Authorization" });
-  
+// Proxy endpoint for Google Cloud Vision API
+app.post('/api/vision', async (req, res) => {
   try {
-    const response = await fetch(`https://api.notion.com/v1/databases/${req.params.id}/query`, {
-      method: "POST",
-      headers: { Authorization: authHeader, "Content-Type": "application/json", "Notion-Version": "2022-06-28" },
-      body: JSON.stringify(req.body)
-    });
-    res.json(await response.json());
+    const { image } = req.body;
+    
+    const response = await fetch(
+      `https://vision.googleapis.com/v1/images:annotate?key=${process.env.GOOGLE_API_KEY}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          requests: [{
+            image: { content: image },
+            features: [{ type: 'DOCUMENT_TEXT_DETECTION' }]
+          }]
+        })
+      }
+    );
+
+    const data = await response.json();
+    res.json(data);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('Vision API Error:', error);
+    res.status(500).json({ 
+      error: error.message,
+      details: 'Failed to process image with Vision API'
+    });
   }
 });
 
-const PORT = process.env.PORT || 3001;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n📔 Journal Scanner proxy running on port ${PORT}\n`);
+  console.log(`🟢 Journal Scanner proxy running on port ${PORT}`);
 });
