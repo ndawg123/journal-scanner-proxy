@@ -117,14 +117,22 @@ app.put("/api/settings", (req, res) => {
   }
 });
 
-// ── Proxy: Create Notion page (uses server-stored token) ──
+// ── Proxy: Create Notion page (uses server-stored token + database ID) ──
 app.post("/api/notion/pages", async (req, res) => {
   const settings = loadSettings();
   const token = settings.notionToken;
+  const dbId = settings.notionDatabaseId;
   if (!token) {
     return res.status(401).json({ message: "Notion token not configured. Go to Settings." });
   }
+  if (!dbId) {
+    return res.status(400).json({ message: "Notion database ID not configured. Go to Settings." });
+  }
   try {
+    // Build the Notion page payload, ensuring the database ID comes from server settings
+    const body = req.body || {};
+    body.parent = { database_id: dbId };
+
     const response = await fetch("https://api.notion.com/v1/pages", {
       method: "POST",
       headers: {
@@ -132,7 +140,7 @@ app.post("/api/notion/pages", async (req, res) => {
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28",
       },
-      body: JSON.stringify(req.body),
+      body: JSON.stringify(body),
     });
     const data = await response.json();
     if (!response.ok) {
@@ -144,6 +152,10 @@ app.post("/api/notion/pages", async (req, res) => {
     }
     res.json(data);
   } catch (error) {
+    console.error("Notion proxy error:", error);
+    res.status(500).json({ message: error.message });
+  }
+});  } catch (error) {
     console.error("Notion proxy error:", error);
     res.status(500).json({ message: error.message });
   }
