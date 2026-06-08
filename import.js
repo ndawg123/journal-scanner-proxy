@@ -49,7 +49,7 @@ function resolveOutputPath(date) {
 
 function writeEntry(date, text) {
   const filePath = resolveOutputPath(date);
-  const content = `---\ndate: ${date}\ntags: [journal, handwritten]\n---\n\n${text.trim()}\n`;
+  const content = `---\ndate: ${date}\ntags: [journal, handwritten]\n---\n\n${text.trim()}\n\n[[Journal Hub]]\n`;
   fs.writeFileSync(filePath, content, 'utf8');
   return path.basename(filePath);
 }

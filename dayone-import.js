@@ -124,7 +124,7 @@ function main() {
     }
 
     const frontmatter = buildFrontmatter(date, entry.uuid, entry.starred, entry.tags);
-    const content = `${frontmatter}\n\n${rawText.trim()}\n`;
+    const content = `${frontmatter}\n\n${rawText.trim()}\n\n[[Journal Hub]]\n`;
     const filePath = resolveOutputPath(date);
     const filename = path.basename(filePath);
 
